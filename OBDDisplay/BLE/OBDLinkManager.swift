@@ -60,6 +60,8 @@ final class OBDLinkManager: NSObject {
     let scanStore = ScanStore()
     /// Letzte Fehlermeldung für einen Hinweis in der Oberfläche
     var lastError: String?
+    /// Systemseitig verbundene Bluetooth-Geräte bei der letzten Suche (zur Fehlersuche im Banner)
+    private(set) var connectedDevices: [String] = []
 
     var isReady: Bool { state == .ready }
 
@@ -78,6 +80,9 @@ final class OBDLinkManager: NSObject {
     @ObservationIgnored private var pendingReads: [OBDLink.Characteristic: [CheckedContinuation<Data, Error>]] = [:]
     @ObservationIgnored private var pendingWrites: [OBDLink.Characteristic: [CheckedContinuation<Void, Error>]] = [:]
     @ObservationIgnored private var discoveryContinuation: CheckedContinuation<Void, Error>?
+    /// Weitere verbundene Geräte, die noch zu prüfen sind, und solche ohne OBD-Link-Service
+    @ObservationIgnored private var candidates: [CBPeripheral] = []
+    @ObservationIgnored private var rejected: Set<UUID> = []
 
     private static let savedPeripheralKey = "savedPeripheral"
     private static let catalogCacheKey = "catalogCache"
@@ -94,16 +99,26 @@ final class OBDLinkManager: NSObject {
         guard let central, central.state == .poweredOn else { return }
         if let peripheral, peripheral.state == .connected || peripheral.state == .connecting { return }
 
-        // 1. Schon systemseitig verbunden (Zeit-Synchronisation über die HID-Verbindung)?
-        let connected = central.retrieveConnectedPeripherals(withServices: [OBDLink.service])
-        let hid = central.retrieveConnectedPeripherals(withServices: [CBUUID(string: "1812")])
-            .filter { $0.name == Self.esp32Name }
-        if let match = connected.first ?? hid.first {
-            connect(match)
+        // 1. Schon systemseitig verbunden (Zeit-Synchronisation über die HID-Verbindung)? iOS liefert das
+        //    Gerät über den OBD-Link-Service nur, wenn es dessen Gerätestruktur kennt, und der Name kann noch
+        //    ein alter sein (gecacht). Deshalb alle verbundenen HID-/Geräteinfo-Geräte der Reihe nach prüfen,
+        //    "OBD-Display" zuerst; Geräte ohne OBD-Link-Service werden übersprungen (setUp).
+        let byService = central.retrieveConnectedPeripherals(withServices: [OBDLink.service])
+        let byProfile = central.retrieveConnectedPeripherals(withServices: [CBUUID(string: "1812"),
+                                                                             CBUUID(string: "180A")])
+            .sorted { ($0.name == Self.esp32Name ? 0 : 1) < ($1.name == Self.esp32Name ? 0 : 1) }
+        var seen = Set<UUID>()
+        let found = (byService + byProfile).filter { seen.insert($0.identifier).inserted }
+        connectedDevices = found.map { $0.name ?? "ohne Namen" }
+        let untried = found.filter { !rejected.contains($0.identifier) }
+        if let first = untried.first {
+            candidates = Array(untried.dropFirst())
+            connect(first)
             return
         }
         // 2. Gemerktes Gerät: connect ohne Zeitlimit, iOS verbindet, sobald es in Reichweite ist.
         if let saved = UserDefaults.standard.string(forKey: Self.savedPeripheralKey).flatMap(UUID.init),
+           !rejected.contains(saved),
            let known = central.retrievePeripherals(withIdentifiers: [saved]).first {
             connect(known)
         }
@@ -119,9 +134,9 @@ final class OBDLinkManager: NSObject {
         central?.connect(target)
     }
 
-    private func handleConnected() {
+    private func handleConnected(_ id: UUID) {
+        guard let peripheral, peripheral.identifier == id else { return }
         central?.stopScan()
-        guard let peripheral else { return }
         UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: Self.savedPeripheralKey)
         state = .loading
         setupTask?.cancel()
@@ -130,7 +145,9 @@ final class OBDLinkManager: NSObject {
         }
     }
 
-    private func handleDisconnected(error: String?) {
+    private func handleDisconnected(_ id: UUID, error: String?) {
+        // Meldung für ein übersprungenes Gerät (ohne OBD-Link-Service) - nicht für das aktuelle
+        guard id == peripheral?.identifier else { return }
         setupTask?.cancel()
         characteristics = [:]
         failPending(with: OBDLinkError.disconnected)
@@ -169,6 +186,9 @@ final class OBDLinkManager: NSObject {
             freeDIDs = FreeDID.list(from: try await read(.freeDIDs))
             state = .ready
             try await sendLiveSubscription()
+        } catch OBDLinkError.serviceMissing {
+            if Task.isCancelled { return }
+            skipCurrentPeripheral()
         } catch {
             // Abgebrochen (Verbindung getrennt): handleDisconnected verbindet bereits neu
             if Task.isCancelled { return }
@@ -176,6 +196,24 @@ final class OBDLinkManager: NSObject {
             // Meist Kopplung abgelehnt oder Verbindung weg: trennen, der Rest läuft über handleDisconnected
             central?.cancelPeripheralConnection(peripheral)
         }
+    }
+
+    /// Das verbundene Gerät hat keinen OBD-Link-Service: überspringen und das nächste prüfen.
+    private func skipCurrentPeripheral() {
+        guard let skipped = peripheral else { return }
+        rejected.insert(skipped.identifier)
+        peripheral = nil
+        central?.cancelPeripheralConnection(skipped)   // trennt nur die App, nicht die Verbindung des Systems
+        if !candidates.isEmpty {
+            connect(candidates.removeFirst())
+            return
+        }
+        if skipped.name == Self.esp32Name {
+            lastError = "„OBD-Display“ ist verbunden, meldet aber keinen OBD-Link-Service. Entweder läuft noch "
+                + "eine ältere Firmware, oder iOS kennt die Gerätestruktur noch von früher: dann unter "
+                + "Einstellungen → Bluetooth „OBD-Display“ ignorieren, neu koppeln und die App neu starten."
+        }
+        findAndConnect()
     }
 
     private func discover(_ peripheral: CBPeripheral) async throws {
@@ -409,7 +447,7 @@ final class OBDLinkManager: NSObject {
     private func handleServices(error: String?) {
         guard let peripheral else { return }
         guard error == nil, let service = peripheral.services?.first(where: { $0.uuid == OBDLink.service }) else {
-            discoveryContinuation?.resume(throwing: OBDLinkError.att(error ?? "OBD-Link-Service fehlt"))
+            discoveryContinuation?.resume(throwing: error.map(OBDLinkError.att) ?? OBDLinkError.serviceMissing)
             discoveryContinuation = nil
             return
         }
@@ -435,6 +473,7 @@ final class OBDLinkManager: NSObject {
     private func handleStateUpdate(_ newState: CBManagerState) {
         switch newState {
         case .poweredOn:
+            rejected = []
             findAndConnect()
         case .unauthorized:
             state = .unauthorized
@@ -462,6 +501,7 @@ enum OBDLinkError: LocalizedError {
     case disconnected
     case badData(String)
     case att(String)
+    case serviceMissing
 
     var errorDescription: String? {
         switch self {
@@ -469,6 +509,7 @@ enum OBDLinkError: LocalizedError {
         case .disconnected: "Verbindung getrennt"
         case .badData(let what): "Ungültige Daten: \(what)"
         case .att(let message): message
+        case .serviceMissing: "OBD-Link-Service fehlt"
         }
     }
 }
@@ -488,19 +529,22 @@ extension OBDLinkManager: CBCentralManagerDelegate {
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
-        MainActor.assumeIsolated { handleConnected() }
+        let id = peripheral.identifier
+        MainActor.assumeIsolated { handleConnected(id) }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral,
                                     error: Error?) {
+        let id = peripheral.identifier
         let message = error?.localizedDescription
-        MainActor.assumeIsolated { handleDisconnected(error: message) }
+        MainActor.assumeIsolated { handleDisconnected(id, error: message) }
     }
 
     nonisolated func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral,
                                     error: Error?) {
+        let id = peripheral.identifier
         let message = error?.localizedDescription
-        MainActor.assumeIsolated { handleDisconnected(error: message) }
+        MainActor.assumeIsolated { handleDisconnected(id, error: message) }
     }
 }
 

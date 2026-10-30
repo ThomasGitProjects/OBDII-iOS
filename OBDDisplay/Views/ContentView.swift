@@ -68,8 +68,17 @@ struct ConnectionBanner: View {
                 } else {
                     ProgressView()
                 }
-                Text(manager.state.text)
-                    .font(.subheadline)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(manager.state.text)
+                        .font(.subheadline)
+                    if manager.state == .searching {
+                        Text(manager.connectedDevices.isEmpty
+                             ? "iOS meldet kein verbundenes passendes Gerät"
+                             : "Verbunden laut iOS: \(manager.connectedDevices.joined(separator: ", "))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Spacer()
             }
             .padding(12)

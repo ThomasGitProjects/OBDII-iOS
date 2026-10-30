@@ -29,6 +29,9 @@ struct ContentView: View {
                 SettingsView()
             }
         }
+        .background(KeyboardDismissOnTap())
+        .scrollDismissesKeyboard(.immediately)
+        .onChange(of: tab) { hideKeyboard() }
         .onChange(of: tab, initial: true) { updateLiveValues() }
         .onChange(of: manager.isReady) { updateLiveValues() }
         .onChange(of: manager.catalog.count) { updateLiveValues() }

@@ -79,6 +79,7 @@ struct SettingsView: View {
                 deviceSection
             }
             .navigationTitle("Einstellungen")
+            .keyboardDoneButton()
             .refreshable { try? await manager.reloadSettings() }
             .confirmationDialog("Neue Verbindung übernehmen?", isPresented: $confirmConnection, titleVisibility: .visible) {
                 Button("Übernehmen") { manager.send(.confirmConnection) }

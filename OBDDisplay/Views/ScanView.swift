@@ -302,6 +302,8 @@ struct AddFreeDIDView: View {
                         .disabled(resolvedKey == nil || saving || !manager.isReady)
                 }
             }
+            .keyboardDoneButton()
+            .scrollDismissesKeyboard(.immediately)
             .onAppear(perform: load)
         }
     }

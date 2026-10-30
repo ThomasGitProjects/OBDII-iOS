@@ -73,3 +73,6 @@ build/
 *.key
 *.mobileprovision
 ExportOptions.plist
+
+## Heruntergeladene CI-Artifacts
+.artifacts/

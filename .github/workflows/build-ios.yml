@@ -1,0 +1,271 @@
+name: Build iOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PROJECT: OBDDisplay.xcodeproj
+  SCHEME: OBDDisplay
+  APP_NAME: OBDDisplay
+  BUNDLE_ID: at.flintech.OBDDisplay
+  ARCHIVE_PATH: build/OBDDisplay.xcarchive
+  EXPORT_PATH: build/export
+  BUILD_NUMBER: ${{ github.run_number }}
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  build:
+    name: Build & Archive
+    runs-on: macos-26
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Select Xcode
+        run: |
+          # Pick the newest installed stable Xcode (no beta / release candidate).
+          XCODE_APP=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -viE 'beta|_rc|release.candidate' | sort -V | tail -n 1 || true)
+          if [[ -n "$XCODE_APP" ]]; then
+            sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+          fi
+          xcodebuild -version
+          MAJOR=$(xcodebuild -version | awk '/^Xcode/ { split($2, v, "."); print v[1] }')
+          if (( MAJOR < 26 )); then
+            echo "::error::Xcode 26 or newer is required for the iOS 26 SDK (found Xcode $MAJOR)."
+            exit 1
+          fi
+          xcodebuild -showsdks | grep -i iphoneos
+
+      - name: Check signing secrets
+        id: signing
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          if [[ -n "$BUILD_CERTIFICATE_BASE64" && -n "$P12_PASSWORD" && -n "$BUILD_PROVISION_PROFILE_BASE64" && -n "$KEYCHAIN_PASSWORD" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Signing secrets found – building a signed IPA."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Signing secrets missing – building an UNSIGNED IPA. See README.md → Code-Signierung."
+          fi
+
+      # ---------- Signed build ----------
+
+      - name: Install certificate into temporary keychain
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERT_PATH="$RUNNER_TEMP/build_certificate.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+
+          printf '%s' "$BUILD_CERTIFICATE_BASE64" | tr -d '\r\n ' | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" > /dev/null
+          # Put the build keychain first in the search list, keep the existing ones (System, login).
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          IDENTITY_LINE=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -E '^[[:space:]]+1\)' || true)
+          if [[ -z "$IDENTITY_LINE" ]]; then
+            echo "::error::No valid code signing identity in the .p12. Check BUILD_CERTIFICATE_BASE64 / P12_PASSWORD (the .p12 must contain the private key)."
+            security find-identity -p codesigning "$KEYCHAIN_PATH" || true
+            exit 1
+          fi
+          SIGN_IDENTITY=$(awk '{ print $2 }' <<< "$IDENTITY_LINE")
+          echo "Signing identity: $(sed -E 's/^.*"(.*)".*$/\1/' <<< "$IDENTITY_LINE")"
+
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "SIGN_IDENTITY=$SIGN_IDENTITY" >> "$GITHUB_ENV"
+
+      - name: Install provisioning profile
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          BUILD_PROVISION_PROFILE_BASE64: ${{ secrets.BUILD_PROVISION_PROFILE_BASE64 }}
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+        run: |
+          PB=/usr/libexec/PlistBuddy
+          PP_PATH="$RUNNER_TEMP/build_pp.mobileprovision"
+          PP_PLIST="$RUNNER_TEMP/build_pp.plist"
+
+          printf '%s' "$BUILD_PROVISION_PROFILE_BASE64" | tr -d '\r\n ' | base64 --decode > "$PP_PATH"
+          security cms -D -i "$PP_PATH" > "$PP_PLIST"
+
+          PROFILE_NAME=$($PB -c "Print :Name" "$PP_PLIST")
+          PROFILE_UUID=$($PB -c "Print :UUID" "$PP_PLIST")
+          PROFILE_TEAM=$($PB -c "Print :TeamIdentifier:0" "$PP_PLIST")
+          PROFILE_APP_ID=$($PB -c "Print :Entitlements:application-identifier" "$PP_PLIST")
+          GET_TASK_ALLOW=$($PB -c "Print :Entitlements:get-task-allow" "$PP_PLIST" 2>/dev/null || echo false)
+          HAS_DEVICES=$($PB -c "Print :ProvisionedDevices" "$PP_PLIST" > /dev/null 2>&1 && echo true || echo false)
+
+          echo "Profile: $PROFILE_NAME ($PROFILE_UUID), team $PROFILE_TEAM, app id $PROFILE_APP_ID"
+
+          if [[ "$PROFILE_APP_ID" != "$PROFILE_TEAM.$BUNDLE_ID" && "$PROFILE_APP_ID" != "$PROFILE_TEAM.*" ]]; then
+            echo "::error::Provisioning profile is for '$PROFILE_APP_ID', but the app uses bundle id '$BUNDLE_ID'."
+            exit 1
+          fi
+          if [[ -n "$TEAM_ID" && "$TEAM_ID" != "$PROFILE_TEAM" ]]; then
+            echo "::error::Secret TEAM_ID ($TEAM_ID) does not match the profile's team ($PROFILE_TEAM)."
+            exit 1
+          fi
+
+          # Ad Hoc and Development profiles list devices; Development profiles also allow debugging.
+          if [[ "$HAS_DEVICES" == true && "$GET_TASK_ALLOW" == true ]]; then
+            EXPORT_METHOD=debugging
+          elif [[ "$HAS_DEVICES" == true ]]; then
+            EXPORT_METHOD=release-testing
+          else
+            EXPORT_METHOD=app-store-connect
+            echo "::warning::Profile has no registered devices – exporting for App Store Connect instead of Ad Hoc."
+          fi
+          echo "Export method: $EXPORT_METHOD"
+
+          # Xcode 16+ reads profiles from UserData; older tooling from MobileDevice.
+          for DIR in "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" "$HOME/Library/MobileDevice/Provisioning Profiles"; do
+            mkdir -p "$DIR"
+            cp "$PP_PATH" "$DIR/$PROFILE_UUID.mobileprovision"
+          done
+
+          {
+            echo "PROFILE_NAME=$PROFILE_NAME"
+            echo "PROFILE_UUID=$PROFILE_UUID"
+            echo "DEVELOPMENT_TEAM=$PROFILE_TEAM"
+            echo "EXPORT_METHOD=$EXPORT_METHOD"
+          } >> "$GITHUB_ENV"
+
+      - name: Archive (signed)
+        if: steps.signing.outputs.enabled == 'true'
+        run: |
+          ARGS=(
+            -project "$PROJECT"
+            -scheme "$SCHEME"
+            -configuration Release
+            -sdk iphoneos
+            -destination 'generic/platform=iOS'
+            -archivePath "$ARCHIVE_PATH"
+            archive
+            CODE_SIGN_STYLE=Manual
+            CODE_SIGN_IDENTITY="$SIGN_IDENTITY"
+            PROVISIONING_PROFILE_SPECIFIER="$PROFILE_NAME"
+            DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM"
+            OTHER_CODE_SIGN_FLAGS="--keychain $KEYCHAIN_PATH"
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+          )
+          if command -v xcbeautify > /dev/null; then
+            xcodebuild "${ARGS[@]}" | xcbeautify --renderer github-actions
+          else
+            xcodebuild "${ARGS[@]}"
+          fi
+
+      - name: Export IPA
+        if: steps.signing.outputs.enabled == 'true'
+        run: |
+          PB=/usr/libexec/PlistBuddy
+          EXPORT_OPTIONS=build/ExportOptions.plist
+          cp ci/ExportOptions.plist.template "$EXPORT_OPTIONS"
+          $PB -c "Set :method $EXPORT_METHOD" "$EXPORT_OPTIONS"
+          $PB -c "Set :teamID $DEVELOPMENT_TEAM" "$EXPORT_OPTIONS"
+          $PB -c "Add :provisioningProfiles:$BUNDLE_ID string $PROFILE_NAME" "$EXPORT_OPTIONS"
+          cat "$EXPORT_OPTIONS"
+
+          xcodebuild -exportArchive \
+            -archivePath "$ARCHIVE_PATH" \
+            -exportOptionsPlist "$EXPORT_OPTIONS" \
+            -exportPath "$EXPORT_PATH"
+
+          IPA="$EXPORT_PATH/$APP_NAME.ipa"
+          mv "$IPA" "$EXPORT_PATH/$APP_NAME-$EXPORT_METHOD-$BUILD_NUMBER.ipa"
+          codesign -dv --verbose=2 "$ARCHIVE_PATH/Products/Applications/$APP_NAME.app" 2>&1 | grep -E '^(Identifier|Authority|TeamIdentifier)='
+
+          {
+            echo "### ✅ Signierte IPA erstellt"
+            echo "- Methode: \`$EXPORT_METHOD\`"
+            echo "- Profil: \`$PROFILE_NAME\`"
+            echo "- Build: \`$BUILD_NUMBER\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------- Unsigned fallback ----------
+
+      - name: Archive (unsigned fallback)
+        if: steps.signing.outputs.enabled != 'true'
+        run: |
+          ARGS=(
+            -project "$PROJECT"
+            -scheme "$SCHEME"
+            -configuration Release
+            -sdk iphoneos
+            -destination 'generic/platform=iOS'
+            -archivePath "$ARCHIVE_PATH"
+            archive
+            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGN_IDENTITY=""
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+          )
+          if command -v xcbeautify > /dev/null; then
+            xcodebuild "${ARGS[@]}" | xcbeautify --renderer github-actions
+          else
+            xcodebuild "${ARGS[@]}"
+          fi
+
+          # An IPA is a zip with the .app inside a Payload folder.
+          mkdir -p build/unsigned/Payload "$EXPORT_PATH"
+          cp -R "$ARCHIVE_PATH/Products/Applications/$APP_NAME.app" build/unsigned/Payload/
+          (cd build/unsigned && zip -qry "../export/$APP_NAME-unsigned-$BUILD_NUMBER.ipa" Payload)
+
+          {
+            echo "### ⚠️ Unsignierte IPA erstellt"
+            echo "Es sind keine Signier-Secrets hinterlegt. Die IPA lässt sich nicht direkt installieren,"
+            echo "kann aber z. B. mit Sideloadly und einer Apple ID signiert werden (siehe README.md)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ---------- Artifacts ----------
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-${{ steps.signing.outputs.enabled == 'true' && 'signed' || 'unsigned' }}-${{ github.run_number }}
+          path: ${{ env.EXPORT_PATH }}/*.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload dSYMs
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_NAME }}-dSYMs-${{ github.run_number }}
+          path: ${{ env.ARCHIVE_PATH }}/dSYMs
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Clean up keychain and profile
+        if: always() && steps.signing.outputs.enabled == 'true'
+        run: |
+          security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true
+          rm -f "$RUNNER_TEMP/build_certificate.p12" "$RUNNER_TEMP/build_pp.mobileprovision" "$RUNNER_TEMP/build_pp.plist"
+          if [[ -n "${PROFILE_UUID:-}" ]]; then
+            rm -f "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/$PROFILE_UUID.mobileprovision" \
+                  "$HOME/Library/MobileDevice/Provisioning Profiles/$PROFILE_UUID.mobileprovision"
+          fi

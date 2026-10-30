@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template for `xcodebuild -exportArchive`. The CI workflow copies it to build/ExportOptions.plist and
+  fills in method, teamID and provisioningProfiles with PlistBuddy, based on the installed profile.
+  method: release-testing = Ad Hoc, debugging = Development, app-store-connect = App Store/TestFlight.
+-->
+<plist version="1.0">
+<dict>
+	<key>method</key>
+	<string>release-testing</string>
+	<key>signingStyle</key>
+	<string>manual</string>
+	<key>teamID</key>
+	<string>TEAM_ID_PLACEHOLDER</string>
+	<key>provisioningProfiles</key>
+	<dict/>
+	<key>stripSwiftSymbols</key>
+	<true/>
+	<key>thinning</key>
+	<string>&lt;none&gt;</string>
+</dict>
+</plist>

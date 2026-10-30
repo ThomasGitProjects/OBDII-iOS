@@ -18,6 +18,9 @@ The checkout lives on Windows, so there's no local Xcode. **GitHub Actions is th
 until a workflow run passes; read failures with `gh run view <id> --log-failed`. Without signing secrets the
 workflow produces an unsigned IPA that the user installs with Sideloadly.
 
+After a successful run, download the IPA to `.artifacts/OBDDisplay-unsigned-<run number>.ipa` (git-ignored).
+Never delete older IPAs there. Add an entry for each new version to `CHANGELOG.md` (German, newest first).
+
 App icon PNGs come from `python tools/make_app_icon.py` (standard library only, ~45 s per variant). Edit the
 script and re-run it instead of editing the PNGs.
 

@@ -83,6 +83,9 @@ final class OBDLinkManager: NSObject {
     /// Weitere verbundene Geräte, die noch zu prüfen sind, und solche ohne OBD-Link-Service
     @ObservationIgnored private var candidates: [CBPeripheral] = []
     @ObservationIgnored private var rejected: Set<UUID> = []
+    @ObservationIgnored private var systemPollTask: Task<Void, Never>?
+    /// Vom Polling übernommenes Gerät, dessen connect noch läuft (nicht erneut abbrechen und neu starten)
+    @ObservationIgnored private var adoptedFromSystem: UUID?
 
     private static let savedPeripheralKey = "savedPeripheral"
     private static let catalogCacheKey = "catalogCache"
@@ -99,18 +102,8 @@ final class OBDLinkManager: NSObject {
         guard let central, central.state == .poweredOn else { return }
         if let peripheral, peripheral.state == .connected || peripheral.state == .connecting { return }
 
-        // 1. Schon systemseitig verbunden (Zeit-Synchronisation über die HID-Verbindung)? iOS liefert das
-        //    Gerät über den OBD-Link-Service nur, wenn es dessen Gerätestruktur kennt, und der Name kann noch
-        //    ein alter sein (gecacht). Deshalb alle verbundenen HID-/Geräteinfo-Geräte der Reihe nach prüfen,
-        //    "OBD-Display" zuerst; Geräte ohne OBD-Link-Service werden übersprungen (setUp).
-        let byService = central.retrieveConnectedPeripherals(withServices: [OBDLink.service])
-        let byProfile = central.retrieveConnectedPeripherals(withServices: [CBUUID(string: "1812"),
-                                                                             CBUUID(string: "180A")])
-            .sorted { ($0.name == Self.esp32Name ? 0 : 1) < ($1.name == Self.esp32Name ? 0 : 1) }
-        var seen = Set<UUID>()
-        let found = (byService + byProfile).filter { seen.insert($0.identifier).inserted }
-        connectedDevices = found.map { $0.name ?? "ohne Namen" }
-        let untried = found.filter { !rejected.contains($0.identifier) }
+        // 1. Schon systemseitig verbunden (Zeit-Synchronisation über die HID-Verbindung)?
+        let untried = systemConnectedCandidates()
         if let first = untried.first {
             candidates = Array(untried.dropFirst())
             connect(first)
@@ -125,6 +118,57 @@ final class OBDLinkManager: NSObject {
         // 3. Zusätzlich suchen (findet das Gerät auch, wenn es noch nie verbunden war)
         state = peripheral == nil ? .searching : .connecting
         central.scanForPeripherals(withServices: [OBDLink.service])
+        startSystemConnectionPolling()
+    }
+
+    /// Systemseitig verbundene Geräte, die noch nicht abgelehnt wurden. iOS liefert das Gerät über den
+    /// OBD-Link-Service nur, wenn es dessen Gerätestruktur kennt, und der Name kann noch ein alter sein
+    /// (gecacht). Deshalb zusätzlich alle verbundenen HID-/Geräteinfo-Geräte, "OBD-Display" zuerst; Geräte ohne
+    /// OBD-Link-Service werden in setUp übersprungen.
+    private func systemConnectedCandidates() -> [CBPeripheral] {
+        guard let central else { return [] }
+        let byService = central.retrieveConnectedPeripherals(withServices: [OBDLink.service])
+        let byProfile = central.retrieveConnectedPeripherals(withServices: [CBUUID(string: "1812"),
+                                                                             CBUUID(string: "180A")])
+            .sorted { ($0.name == Self.esp32Name ? 0 : 1) < ($1.name == Self.esp32Name ? 0 : 1) }
+        var seen = Set<UUID>()
+        let found = (byService + byProfile).filter { seen.insert($0.identifier).inserted }
+        connectedDevices = found.map { $0.name ?? "ohne Namen" }
+        return found.filter { !rejected.contains($0.identifier) }
+    }
+
+    /// Startet die App vor der Systemverbindung, verbindet iOS den gekoppelten ESP32 kurz darauf selbst (HID).
+    /// Danach sendet er kein Advertising mehr, der Scan findet ihn also nie. Deshalb solange nicht verbunden alle
+    /// 2 s nachsehen, ob iOS inzwischen ein passendes Gerät verbunden hat, und dieses übernehmen.
+    private func startSystemConnectionPolling() {
+        guard systemPollTask == nil else { return }
+        systemPollTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                self?.checkSystemConnections()
+            }
+        }
+    }
+
+    private func stopSystemConnectionPolling() {
+        systemPollTask?.cancel()
+        systemPollTask = nil
+    }
+
+    private func checkSystemConnections() {
+        guard let central, central.state == .poweredOn, peripheral?.state != .connected,
+              let first = systemConnectedCandidates().first,
+              first.identifier != adoptedFromSystem else { return }   // läuft schon
+        // Ausstehenden connect bzw. Scan aufgeben; peripheral vorher leeren, damit die Abbruchmeldung des
+        // alten connect in handleDisconnected ignoriert wird.
+        if let pending = peripheral {
+            peripheral = nil
+            central.cancelPeripheralConnection(pending)
+        }
+        central.stopScan()
+        candidates = []
+        adoptedFromSystem = first.identifier
+        connect(first)
     }
 
     private func connect(_ target: CBPeripheral) {
@@ -137,6 +181,8 @@ final class OBDLinkManager: NSObject {
     private func handleConnected(_ id: UUID) {
         guard let peripheral, peripheral.identifier == id else { return }
         central?.stopScan()
+        stopSystemConnectionPolling()
+        adoptedFromSystem = nil
         UserDefaults.standard.set(peripheral.identifier.uuidString, forKey: Self.savedPeripheralKey)
         state = .loading
         setupTask?.cancel()
@@ -148,6 +194,7 @@ final class OBDLinkManager: NSObject {
     private func handleDisconnected(_ id: UUID, error: String?) {
         // Meldung für ein übersprungenes Gerät (ohne OBD-Link-Service) - nicht für das aktuelle
         guard id == peripheral?.identifier else { return }
+        adoptedFromSystem = nil
         setupTask?.cancel()
         characteristics = [:]
         failPending(with: OBDLinkError.disconnected)
@@ -162,6 +209,7 @@ final class OBDLinkManager: NSObject {
         // Sofort wieder verbinden (A-CON-04); ein ausstehender connect hat kein Zeitlimit.
         state = .connecting
         central.connect(peripheral)
+        startSystemConnectionPolling()
     }
 
     /// Nach dem Verbinden: Services, Geräteinfo, Katalog, Notifications, Einstellungen, Live-Abo.
@@ -479,6 +527,7 @@ final class OBDLinkManager: NSObject {
             state = .unauthorized
         default:
             state = .bluetoothOff
+            stopSystemConnectionPolling()
             failPending(with: OBDLinkError.disconnected)
         }
     }

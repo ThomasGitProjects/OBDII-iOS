@@ -3,6 +3,18 @@
 Jede Version entspricht einem Build von GitHub Actions. Die Versionsnummer ist die Laufnummer des Workflows,
 die IPA liegt lokal als `.artifacts/OBDDisplay-unsigned-<Version>.ipa`.
 
+## Version 6 – 30.10.2026
+
+- Verbindung kommt jetzt auch zustande, wenn die App vor der Bluetooth-Verbindung des iPhones zum ESP32 gestartet
+  wird. Vorher blieb sie bei „Suche OBD-Display“ hängen: iOS verbindet den gekoppelten ESP32 selbst, danach sendet
+  er kein Advertising mehr und der Scan der App fand ihn nie. Die App prüft nun, solange keine Verbindung
+  besteht, alle 2 s, ob iOS ein passendes Gerät verbunden hat, und übernimmt es.
+- Dasselbe gilt nach einem Verbindungsabbruch (z. B. Neustart des ESP32).
+
+## Version 5 – 30.10.2026 (Commit `e8af0c7`)
+
+- Keine Änderung an der App, nur dieses Changelog hinzugefügt.
+
 ## Version 4 – 30.10.2026 (Commit `fd47c8b`)
 
 - Die Tastatur verschwindet beim Tippen außerhalb eines Eingabefelds, beim Scrollen und beim Tabwechsel.
